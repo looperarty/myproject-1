@@ -1,6 +1,8 @@
 import logging
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler
+# ИСПРАВЛЕНИЕ: Добавлен CallbackQueryHandler в импорты
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler, Application 
+import datetime 
 
 from facebook_business.api import FacebookAdsApi
 from facebook_business.adobjects.adaccount import AdAccount
@@ -8,45 +10,62 @@ from facebook_business.adobjects.campaign import Campaign
 from facebook_business.adobjects.adset import AdSet 
 from facebook_business.exceptions import FacebookRequestError
 
-import io # Для работы с буфером для изображений
-import matplotlib.pyplot as plt # Для построения графиков
+import io 
+import matplotlib.pyplot as plt 
 
-# Устанавливаем стиль для matplotlib (необязательно, но может улучшить вид)
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+import json 
+import os 
+
 plt.style.use('seaborn-v0_8-darkgrid') 
 
 # --- КЛЮЧИ И НАСТРОЙКИ ---
-# !!! ВНИМАТЕЛЬНО ЗАПОЛНИ ВСЕ 5 ЗНАЧЕНИЙ СВОИМИ ДАННЫМИ !!!
-# Получи свой Telegram Token у BotFather
 TELEGRAM_TOKEN = '7879718352:AAFdjjlblqNROm4mq8GLB9pnRdUPIaq8lHw' 
-# Твой Telegram ID (числом, без кавычек). Узнать можно через @userinfobot (напиши ему /start и он покажет твой ID)
-ADMIN_TELEGRAM_ID = 5625120142  # Например: 1234567890
+ADMIN_TELEGRAM_ID = 5625120142  
 
-# Получи Facebook Access Token, App ID, App Secret из своего Meta For Developers приложения.
-# Убедись, что токен имеет нужные разрешения (scopes), например: 
-# ads_read, ads_management, pages_read_engagement, pages_messaging, leads_retrieval, read_insights.
 FB_ACCESS_TOKEN = 'EAAJ8ZBYdYhHIBOZCtL2GHEqqqfwaGKcu0nTsV8Ch0lYzZBdhlqZB80ggz3kbgYHJDW0tpik45sfnzfjaSACeOFitccutYsnjIc1fPQTa7Q1nTyaZAcBLzXnp2BrEmrnPkNUkRo7SYoEQWQuczLU1pqKVRgYCEAWeJcTy05CsBWjM2DBUJ5ZBl21JFOUcT4r9VpN2xJyN2vssZARo6YjNKoPHxIDNZCTlF9ZB2ZAsud5mt9HKdD0N8348oZD' 
 FB_APP_ID = '700361112847474'
 FB_APP_SECRET = 'c947026dfd934f50d832a65eae000ba1'
-# Твой ID рекламного аккаунта. Формат: 'act_1234567890'. Найти можно в URL Ads Manager или настройках.
-AD_ACCOUNT_ID = 'act_1573639266674008' # Твой рекламный ID уже вставлен
+AD_ACCOUNT_ID = 'act_1573639266674008' 
 # -----------------------------------------
 
-# Настройка логирования для отладки: выводит сообщения в консоль
+# --- Настройки для автоматических отчетов ---
+SETTINGS_FILE = 'bot_settings.json' 
+
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        with open(SETTINGS_FILE, 'r') as f:
+            try:
+                return json.load(f)
+            except json.JSONDecodeError:
+                logging.error(f"Ошибка чтения файла настроек {SETTINGS_FILE}. Используем значения по умолчанию.")
+                return {'auto_reports_enabled': False, 'report_time': '09:00'}
+    return {'auto_reports_enabled': False, 'report_time': '09:00'} 
+
+def save_settings(settings):
+    with open(SETTINGS_FILE, 'w') as f:
+        json.dump(settings, f, indent=4)
+
+bot_settings = load_settings()
+
+scheduler = AsyncIOScheduler()
+
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Обрабатывает команду /start.
-    Проверяет, является ли пользователь администратором, и отображает основное меню.
-    """
     user_id = update.effective_user.id
     if user_id != ADMIN_TELEGRAM_ID:
         await context.bot.send_message(chat_id=user_id, text="Извините, у вас нет доступа к этому боту.")
         logging.warning(f"Попытка доступа неавторизованного пользователя: {user_id}")
         return
 
-    # Основная клавиатура с кнопками
-    keyboard = [[KeyboardButton("📊 Получить отчет")], [KeyboardButton("❓ Помощь")]]
+    keyboard = [
+        [KeyboardButton("📊 Получить отчет")], 
+        [KeyboardButton("💸 Потрачено")], 
+        [KeyboardButton("⚙️ Настройки")], 
+        [KeyboardButton("❓ Помощь")]
+    ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await context.bot.send_message(
         chat_id=update.effective_chat.id, 
@@ -56,10 +75,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"Админ {user_id} запустил бот.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Обрабатывает текстовые сообщения от пользователя.
-    Перенаправляет на функцию выбора периода или помощи.
-    """
     user_id = update.effective_user.id
     if user_id != ADMIN_TELEGRAM_ID: 
         await context.bot.send_message(chat_id=user_id, text="Извините, у вас нет доступа к этому боту.")
@@ -68,7 +83,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     
     if text == "📊 Получить отчет":
-        await ask_for_period(update, context) # Вызов функции для выбора периода
+        context.user_data['action_type'] = 'get_full_report' 
+        await ask_for_period(update, context) 
+    elif text == "💸 Потрачено": 
+        context.user_data['action_type'] = 'get_spend_summary' 
+        await ask_for_period(update, context) 
+    elif text == "⚙️ Настройки": 
+        await show_settings_menu(update, context) 
     elif text == "❓ Помощь":
         await context.bot.send_message(
             chat_id=update.effective_chat.id, 
@@ -81,8 +102,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def ask_for_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет инлайн-клавиатуру для выбора периода отчета по статистике."""
-    # Инлайн-кнопки для выбора временного периода (callback_data начинаются с 'period_')
     keyboard = [
         [InlineKeyboardButton("За сегодня", callback_data='period_today')],
         [InlineKeyboardButton("За вчера", callback_data='period_yesterday')],
@@ -97,26 +116,70 @@ async def ask_for_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['last_message_id'] = update.message.message_id
     context.user_data['chat_id'] = update.effective_chat.id
 
+async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    auto_reports_enabled = bot_settings.get('auto_reports_enabled', False)
+    status_text = "Вкл" if auto_reports_enabled else "Выкл"
+
+    keyboard = [
+        [InlineKeyboardButton(f"Автоматические отчеты: {status_text}", callback_data='setting_toggle_auto_reports')],
+        [InlineKeyboardButton("↩️ Назад", callback_data='setting_back_to_main_menu')] 
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id, 
+        text="Выберите настройку:", 
+        reply_markup=reply_markup
+    )
+    logging.info(f"Админ {user_id} открыл меню настроек.")
+
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Обрабатывает нажатия инлайн-кнопок для выбора периода и уровня детализации.
-    Запрашивает данные из Facebook Ads API и формирует отчет.
-    """
     query = update.callback_query
-    await query.answer() # Обязательно "отвечаем" на callback query, чтобы убрать индикатор загрузки у кнопки
+    await query.answer() 
 
-    data = query.data # Получаем значение callback_data (например, 'period_today' или 'level_campaigns')
+    data = query.data 
     user_id = query.from_user.id
     chat_id = query.message.chat_id
 
-    # Логика обработки callback_data:
-    # 1. Если пользователь выбрал период
     if data.startswith('period_'):
-        period_type = data.replace('period_', '') # Получаем 'today', 'yesterday' и т.д.
-        context.user_data['selected_period'] = period_type # Сохраняем выбранный период в user_data
+        period_type = data.replace('period_', '') 
+        context.user_data['selected_period'] = period_type 
+        
+        if context.user_data.get('action_type') == 'get_spend_summary':
+            await query.edit_message_text(text=f"Минутку, запрашиваю общие траты за '{period_type.replace('_', ' ').title()}' у Facebook...")
+            logging.info(f"Админ {user_id} запросил общие траты за {period_type}.")
+            try:
+                FacebookAdsApi.init(app_id=FB_APP_ID, app_secret=FB_APP_SECRET, access_token=FB_ACCESS_TOKEN)
+                account = AdAccount(AD_ACCOUNT_ID)
+                
+                insights_data = list(account.get_insights(
+                    params={'date_preset': period_type, 'fields': 'spend'}
+                ))
+                
+                total_spend = "0"
+                if insights_data and insights_data[0]:
+                    total_spend = insights_data[0].get('spend', '0')
+                
+                report_text = f"💸 **Общие траты по аккаунту ({period_type.replace('_', ' ').title()}):**\n\n" \
+                              f"  Всего потрачено: **${float(total_spend):.2f}**"
+                
+                await query.edit_message_text(text=report_text, parse_mode='Markdown')
+                logging.info(f"Общие траты отправлены админу {user_id} за период {period_type}.")
 
-        # Предлагаем выбрать уровень детализации отчета
+            except FacebookRequestError as e:
+                error_message = f"Ошибка Facebook API: Код: {e.api_error_code()} - Сообщение: {e.api_error_message()}"
+                logging.error(f"Ошибка Facebook API для админа {user_id}: {error_message}", exc_info=True)
+                await query.edit_message_text(text=error_message)
+            except Exception as e:
+                full_error = f"Что-то пошло не так: {e}"
+                logging.error(f"Неизвестная ошибка: {full_error}", exc_info=True)
+                await query.edit_message_text(text=f"Что-то пошло не так: {e}")
+            
+            context.user_data.pop('action_type', None) 
+            return 
+
         keyboard = [
             [InlineKeyboardButton("По кампаниям (подробно)", callback_data='level_campaigns')],
             [InlineKeyboardButton("По группам объявлений (подробно)", callback_data='level_adsets')], 
@@ -124,25 +187,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📊 Сравнить Вчера vs Сегодня", callback_data='level_compare_daily')], 
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        # Редактируем предыдущее сообщение, чтобы показать следующий шаг
         await query.edit_message_text(
             text=f"Период: {period_type.replace('_', ' ').title()}. Теперь выберите уровень отчета:", 
             reply_markup=reply_markup
         )
         logging.info(f"Админ {user_id} выбрал период: {period_type}. Запрос уровня детализации.")
 
-    # 2. Если пользователь выбрал уровень детализации или сравнение
     elif data.startswith('level_'):
         level_type = data.replace('level_', '') 
         selected_period = context.user_data.get('selected_period')
 
-        # Для сравнения периода (Вчера vs Сегодня) конкретный 'selected_period' не нужен, он фиксирован
         if level_type != 'compare_daily' and not selected_period:
-            await query.edit_message_text("Ошибка: Период не выбран. Пожалуйста, начните заново, нажав '📊 Получить отчет'.")
+            await context.bot.send_message(chat_id=chat_id, text="Ошибка: Период не выбран. Пожалуйста, начните заново, нажав '📊 Получить отчет'.")
             logging.error(f"Админ {user_id} попытался выбрать уровень без выбранного периода.")
             return
 
-        # Отправляем новое сообщение вместо редактирования, так как оно будет первым из нескольких частей отчета
         await context.bot.send_message(chat_id=chat_id, text=f"Минутку, запрашиваю статистику по '{level_type.replace('_', ' ').title()}' у Facebook...")
         logging.info(f"Админ {user_id} запросил отчет по {level_type} за {selected_period if level_type != 'compare_daily' else 'сегодня/вчера'}.")
 
@@ -159,7 +218,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif level_type == 'brief_adsets_messages': 
                 response_parts = await get_brief_adset_report(account, selected_period)
             elif level_type == 'compare_daily': 
-                # Для этой функции period берется внутри, передаем bot для отправки фото
                 response_parts = await get_daily_comparison_report(account, chat_id, context.bot) 
                 
             else:
@@ -168,11 +226,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if response_parts:
                 for part in response_parts:
-                    # Проверяем, если часть не является изображением, то отправляем как текст
-                    if isinstance(part, str):
+                    if isinstance(part, str): 
                         await context.bot.send_message(chat_id=chat_id, text=part, parse_mode='Markdown')
-                    # Изображения отправляются напрямую из get_daily_comparison_report, 
-                    # поэтому здесь мы не обрабатываем их
                 logging.info(f"Отчет успешно отправлен админу {user_id} за период {selected_period if level_type != 'compare_daily' else 'сегодня/вчера'}.")
             else:
                 await context.bot.send_message(chat_id=chat_id, text="Не удалось сгенерировать отчет. Возможно, нет данных.", parse_mode='Markdown')
@@ -183,9 +238,55 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"Ошибка Facebook API для админа {user_id}: {error_message}", exc_info=True)
             await context.bot.send_message(chat_id=chat_id, text=error_message) 
         except Exception as e:
-            full_error = f"Неизвестная ошибка: {e}"
-            logging.error(f"Неизвестная ошибка для админа {user_id}: {full_error}", exc_info=True)
+            full_error = f"Что-то пошло не так: {e}"
+            logging.error(f"Неизвестная ошибка: {full_error}", exc_info=True)
             await context.bot.send_message(chat_id=chat_id, text=f"Что-то пошло не так: {e}") 
+
+    # 3. Если пользователь нажал кнопку настройки
+    elif data.startswith('setting_'):
+        setting_type = data.replace('setting_', '')
+        user_id = query.from_user.id
+        chat_id = query.message.chat_id
+
+        if setting_type == 'toggle_auto_reports':
+            current_status = bot_settings.get('auto_reports_enabled', False) 
+            new_status = not current_status
+            bot_settings['auto_reports_enabled'] = new_status 
+            save_settings(bot_settings) 
+
+            if new_status:
+                scheduler.add_job(
+                    send_daily_auto_report,
+                    CronTrigger(hour=bot_settings['report_time'].split(':')[0], minute=bot_settings['report_time'].split(':')[1]),
+                    args=[context.bot, ADMIN_TELEGRAM_ID, FB_ACCESS_TOKEN, FB_APP_ID, FB_APP_SECRET, AD_ACCOUNT_ID],
+                    id='daily_auto_report',
+                    replace_existing=True 
+                )
+                status_text = "Включены"
+                logging.info(f"Автоматическая рассылка отчетов активирована. Время: {bot_settings['report_time']}")
+            else:
+                if scheduler.get_job('daily_auto_report'):
+                    scheduler.remove_job('daily_auto_report')
+                    logging.info("Автоматическая рассылка отчетов деактивирована.")
+                status_text = "Выключены"
+            
+            await query.edit_message_text(f"Автоматические отчеты теперь: **{status_text}**.", parse_mode='Markdown')
+            logging.info(f"Админ {user_id} переключил автоотчеты в статус: {status_text}.")
+            await show_settings_menu(update, context) 
+        
+        elif setting_type == 'back_to_main_menu': 
+            await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
+            keyboard = [[KeyboardButton("📊 Получить отчет")], 
+                        [KeyboardButton("💸 Потрачено")], 
+                        [KeyboardButton("⚙️ Настройки")], 
+                        [KeyboardButton("❓ Помощь")]]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            await context.bot.send_message(chat_id=chat_id, text="Добро пожаловать в главное меню!", reply_markup=reply_markup)
+            logging.info(f"Админ {user_id} вернулся в главное меню.")
+
+        else:
+            await query.edit_message_text("Неизвестная настройка.")
+            logging.warning(f"Неизвестная настройка: {setting_type} для админа {user_id}.")
 
 # Вспомогательная функция для разбивки текста на части (чтобы не превышать лимит Telegram)
 def split_message(text: str, max_length: int = 4000) -> list[str]:
@@ -204,6 +305,30 @@ def split_message(text: str, max_length: int = 4000) -> list[str]:
         parts.append(current_part.strip())
         
     return parts
+
+async def send_daily_auto_report(bot_instance, chat_id: int, ad_account_id: str, fb_access_token: str, fb_app_id: str, fb_app_secret: str):
+    """
+    Отправляет ежедневный автоматический отчет админу.
+    Эта функция будет запускаться планировщиком.
+    """
+    logging.info(f"Запуск автоматической рассылки отчета для админа {chat_id}...")
+    try:
+        FacebookAdsApi.init(app_id=fb_app_id, app_secret=fb_app_secret, access_token=fb_access_token)
+        account = AdAccount(ad_account_id)
+        
+        report_parts = await get_campaign_report(account, 'today') 
+
+        if report_parts:
+            await bot_instance.send_message(chat_id=chat_id, text="📊 **Ежедневный автоматический отчет:**", parse_mode='Markdown')
+            for part in report_parts:
+                await bot_instance.send_message(chat_id=chat_id, text=part, parse_mode='Markdown')
+            logging.info(f"Ежедневный автоматический отчет успешно отправлен админу {chat_id}.")
+        else:
+            await bot_instance.send_message(chat_id=chat_id, text="Не удалось сгенерировать ежедневный автоматический отчет. Возможно, нет данных.", parse_mode='Markdown')
+
+    except Exception as e:
+        logging.error(f"Ошибка при автоматической рассылке отчета админу {chat_id}: {e}", exc_info=True)
+        await bot_instance.send_message(chat_id=chat_id, text=f"**Ошибка при отправке автоматического отчета:**\n{e}")
 
 async def get_campaign_report(account: AdAccount, period: str) -> list[str]:
     """Формирует подробный отчет по кампаниям и возвращает список строк (частей сообщения)."""
@@ -272,8 +397,7 @@ async def get_campaign_report(account: AdAccount, period: str) -> list[str]:
             f"  - ✨ Конверсии (общие): **{conversions}**\n"
             f"  - 💬 Начато переписок: **{messenger_sends}**\n" 
             f"  - 💰 Цена за переписку: **${float(cost_per_messenger_send):.2f}**\n" 
-            f"  - 📝 Лиды (с форм): **{leads_generated}**\n" 
-            f"  - 💰 Цена за лид: **${float(cost_per_lead):.2f}**\n" 
+            f"  - 📝 Лиды (с форм): **${float(cost_per_lead):.2f}**\n" 
             f"  - 🔁 Частота: **${float(frequency):.2f}**\n\n"
         )
         all_campaign_details.append(campaign_detail_text)
@@ -512,6 +636,7 @@ async def get_daily_comparison_report(account: AdAccount, chat_id: int, bot) -> 
     report_lines.append("📊 **Сравнение показателей: Сегодня vs Вчера (по аккаунту)**\n\n")
 
     # Потрачено
+    # Используем 1e-9 (очень маленькое число) вместо 0 для деления, чтобы избежать ошибок, но при этом получить корректный процент
     spend_diff_percent = ((spend_today - spend_yesterday) / (spend_yesterday or 1e-9) * 100) if spend_today > 0 or spend_yesterday > 0 else 0
     report_lines.append(f"💸 Потрачено:\n  - Сегодня: **${spend_today:.2f}**\n  - Вчера: **${spend_yesterday:.2f}**\n  - Изменение: {spend_diff_percent:.2f}% {'⬆️' if spend_diff_percent > 0 else ('⬇️' if spend_diff_percent < 0 else '↔️')}\n\n")
 
@@ -535,8 +660,7 @@ async def get_daily_comparison_report(account: AdAccount, chat_id: int, bot) -> 
             bar_width = 0.5 # Толщина полосы
 
             # --- График трат ---
-            # Уменьшаем высоту figure для тонких полос
-            fig1, ax1 = plt.subplots(figsize=(6, 3)) 
+            fig1, ax1 = plt.subplots(figsize=(6, 3)) # Уменьшил высоту для тонких полос
             spends = [spend_yesterday, spend_today]
             
             # Горизонтальная гистограмма
@@ -562,7 +686,7 @@ async def get_daily_comparison_report(account: AdAccount, chat_id: int, bot) -> 
             await bot.send_photo(chat_id=chat_id, photo=buf1, caption="Динамика трат по аккаунту:")
             
             # --- График количества переписок ---
-            fig2, ax2 = plt.subplots(figsize=(6, 3)) # Уменьшаем высоту figure
+            fig2, ax2 = plt.subplots(figsize=(6, 3)) # Уменьшил высоту
             sends_counts = [sends_yesterday_val, sends_today_val]
             
             # Горизонтальная гистограмма
@@ -597,14 +721,54 @@ async def get_daily_comparison_report(account: AdAccount, chat_id: int, bot) -> 
     return split_message("".join(report_lines))
 
 
+# Новая вспомогательная функция для безопасного запуска планировщика
+async def start_scheduler_safely(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Запускает APScheduler и добавляет задачи, если они включены,
+    после того как Telegram-бот полностью инициализируется.
+    """
+    logging.info("Функция start_scheduler_safely запущена.")
+
+    if not scheduler.running:
+        scheduler.start()
+        logging.info("Планировщик APScheduler успешно запущен через job_queue.")
+
+    # Re-add the daily report job if auto-reports are enabled in settings
+    if bot_settings['auto_reports_enabled']:
+        if 'daily_auto_report' not in [job.id for job in scheduler.get_jobs()]: 
+            scheduler.add_job(
+                send_daily_auto_report,
+                CronTrigger(hour=bot_settings['report_time'].split(':')[0], minute=bot_settings['report_time'].split(':')[1]),
+                args=[context.bot, ADMIN_TELEGRAM_ID, FB_ACCESS_TOKEN, FB_APP_ID, FB_APP_SECRET, AD_ACCOUNT_ID],
+                id='daily_auto_report',
+                replace_existing=True 
+            )
+            logging.info(f"Задача автоматической рассылки отчетов добавлена/обновлена через job_queue. Время: {bot_settings['report_time']}")
+    else:
+        if scheduler.get_job('daily_auto_report'): 
+            scheduler.remove_job('daily_auto_report')
+            logging.info("Автоматическая рассылка отчетов деактивирована при старте.")
+
+
 # --- Запуск бота ---
 if __name__ == '__main__':
     print("Запускаем Telegram бота...")
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
+    # Передаем FB API ключи и ID в bot_data, чтобы они были доступны для send_daily_auto_report
+    application.bot_data['admin_chat_id'] = ADMIN_TELEGRAM_ID
+    application.bot_data['fb_access_token'] = FB_ACCESS_TOKEN
+    application.bot_data['fb_app_id'] = FB_APP_ID
+    application.bot_data['fb_app_secret'] = FB_APP_SECRET
+    application.bot_data['ad_account_id'] = AD_ACCOUNT_ID
+
+    # НОВОЕ: Используем job_queue для безопасного запуска планировщика
+    application.job_queue.run_once(start_scheduler_safely, 0) 
+
+    # Регистрируем обработчики для команд, текстовых сообщений и инлайн-кнопок
     application.add_handler(CommandHandler('start', start))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    
+    application.add_handler(CallbackQueryHandler(button_callback)) # <-- ВОТ ОН, CallbackQueryHandler
+
     print("Бот успешно запущен и ожидает событий...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
