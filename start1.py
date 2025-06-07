@@ -1,6 +1,5 @@
 import logging
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
-# ИСПРАВЛЕНИЕ: Добавлен CallbackQueryHandler в импорты
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler, Application 
 import datetime 
 
@@ -18,6 +17,10 @@ from apscheduler.triggers.cron import CronTrigger
 import json 
 import os 
 
+# --- НОВЫЙ ИМПОРТ ДЛЯ GEMINI ---
+import google.generativeai as genai 
+# --- КОНЕЦ НОВЫХ ИМПОРТОВ ---
+
 plt.style.use('seaborn-v0_8-darkgrid') 
 
 # --- КЛЮЧИ И НАСТРОЙКИ ---
@@ -28,6 +31,10 @@ FB_ACCESS_TOKEN = 'EAAJ8ZBYdYhHIBOZCtL2GHEqqqfwaGKcu0nTsV8Ch0lYzZBdhlqZB80ggz3kb
 FB_APP_ID = '700361112847474'
 FB_APP_SECRET = 'c947026dfd934f50d832a65eae000ba1'
 AD_ACCOUNT_ID = 'act_1573639266674008' 
+
+# НОВЫЙ КЛЮЧ: Для Google Gemini AI. Получи на https://aistudio.google.com/app/apikey
+
+GEMINI_API_KEY = ' AIzaSyC1iI5X5zxTQtyqVrE1dDc3P_CbznpNywc' 
 # -----------------------------------------
 
 # --- Настройки для автоматических отчетов ---
@@ -54,6 +61,10 @@ scheduler = AsyncIOScheduler()
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает команду /start.
+    Проверяет, является ли пользователь администратором, и отображает основное меню.
+    """
     user_id = update.effective_user.id
     if user_id != ADMIN_TELEGRAM_ID:
         await context.bot.send_message(chat_id=user_id, text="Извините, у вас нет доступа к этому боту.")
@@ -64,6 +75,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [KeyboardButton("📊 Получить отчет")], 
         [KeyboardButton("💸 Потрачено")], 
         [KeyboardButton("⚙️ Настройки")], 
+        [KeyboardButton("✍️ Писатель AI")], # <-- ОБНОВЛЕННАЯ КНОПКА
         [KeyboardButton("❓ Помощь")]
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -75,6 +87,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"Админ {user_id} запустил бот.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает текстовые сообщения от пользователя.
+    Перенаправляет на функцию выбора периода, настроек или помощи.
+    """
     user_id = update.effective_user.id
     if user_id != ADMIN_TELEGRAM_ID: 
         await context.bot.send_message(chat_id=user_id, text="Извините, у вас нет доступа к этому боту.")
@@ -82,6 +98,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     text = update.message.text
     
+    # --- НОВЫЙ БЛОК: Если бот в режиме AI ---
+    if context.user_data.get('ai_writer_mode_active'): # Используем новый флаг
+        await generate_text_with_ai(update, context, text) # Вызываем generate_text_with_ai
+        context.user_data['ai_writer_mode_active'] = False # Выходим из режима AI после ответа
+        return # Важно, чтобы не обрабатывать сообщение дальше
+    # --- КОНЕЦ БЛОКА РЕЖИМА AI ---
+
+
     if text == "📊 Получить отчет":
         context.user_data['action_type'] = 'get_full_report' 
         await ask_for_period(update, context) 
@@ -90,10 +114,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask_for_period(update, context) 
     elif text == "⚙️ Настройки": 
         await show_settings_menu(update, context) 
+    elif text == "✍️ Писатель AI": # <-- ОБНОВЛЕННЫЙ ТЕКСТ КНОПКИ
+        context.user_data['ai_writer_mode_active'] = True # Активируем режим AI
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id, 
+            text="Вы вошли в режим 'Писатель AI (Gemini)'. Введите свой запрос (промпт) для генерации текста:"
+        )
     elif text == "❓ Помощь":
         await context.bot.send_message(
             chat_id=update.effective_chat.id, 
-            text="Этот бот поможет вам следить за показателями ваших рекламных кампаний в Facebook (Meta)."
+            text="Этот бот поможет вам следить за рекламой и генерировать тексты с помощью AI."
         )
     else:
         await context.bot.send_message(
@@ -102,6 +132,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def ask_for_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет инлайн-клавиатуру для выбора периода отчета по статистике."""
     keyboard = [
         [InlineKeyboardButton("За сегодня", callback_data='period_today')],
         [InlineKeyboardButton("За вчера", callback_data='period_yesterday')],
@@ -117,6 +148,7 @@ async def ask_for_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['chat_id'] = update.effective_chat.id
 
 async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню настроек бота."""
     user_id = update.effective_user.id
     auto_reports_enabled = bot_settings.get('auto_reports_enabled', False)
     status_text = "Вкл" if auto_reports_enabled else "Выкл"
@@ -136,6 +168,10 @@ async def show_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает нажатия инлайн-кнопок для выбора периода, уровня детализации и настроек.
+    Запрашивает данные из Facebook Ads API и формирует отчет.
+    """
     query = update.callback_query
     await query.answer() 
 
@@ -242,7 +278,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logging.error(f"Неизвестная ошибка: {full_error}", exc_info=True)
             await context.bot.send_message(chat_id=chat_id, text=f"Что-то пошло не так: {e}") 
 
-    # 3. Если пользователь нажал кнопку настройки
     elif data.startswith('setting_'):
         setting_type = data.replace('setting_', '')
         user_id = query.from_user.id
@@ -749,26 +784,74 @@ async def start_scheduler_safely(context: ContextTypes.DEFAULT_TYPE):
             scheduler.remove_job('daily_auto_report')
             logging.info("Автоматическая рассылка отчетов деактивирована при старте.")
 
+# --- НАЧАЛО РАЗДЕЛА: НОВЫЙ ФУНКЦИОНАЛ (ЧАСТЬ 2) ---
+# Все новые функции, связанные с будущими "фишками", будут добавляться здесь.
+# Существующие функции (например, start, handle_message, button_callback)
+# будут лишь минимально модифицироваться для вызова этих новых функций.
+# --- КОНЕЦ РАЗДЕЛА: НОВЫЙ ФУНКЦИОНАЛ (ЧАСТЬ 2) ---
+
+# Здесь будет новая функция для взаимодействия с AI (Gemini)
+async def generate_text_with_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
+    """
+    Генерирует текст с помощью Google Gemini AI на основе пользовательского промпта.
+    """
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    await context.bot.send_message(chat_id=chat_id, text="✍️ Запрос принят. Генерация текста с помощью AI (Gemini)...")
+    logging.info(f"Админ {user_id} отправил запрос AI: '{prompt[:50]}...'")
+
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+
+        model = genai.GenerativeModel('gemini-1.0-pro') 
+        response = await model.generate_content_async(prompt) 
+
+        generated_text = response.text.strip()
+        
+        text_parts = split_message(generated_text)
+        
+        await context.bot.send_message(chat_id=chat_id, text="Вот что сгенерировал AI (Gemini):")
+        for part in text_parts:
+            await context.bot.send_message(chat_id=chat_id, text=part, parse_mode='Markdown')
+        
+        logging.info(f"AI (Gemini) успешно сгенерировал текст для админа {user_id}.")
+
+    except Exception as e: 
+        error_message = f"Ошибка при обращении к AI (Gemini) API: {e}"
+        logging.error(f"Ошибка AI (Gemini) API для админа {user_id}: {error_message}", exc_info=True)
+        await context.bot.send_message(chat_id=chat_id, text=f"**Ошибка при обращении к AI (Gemini) API:**\n{e}")
 
 # --- Запуск бота ---
 if __name__ == '__main__':
     print("Запускаем Telegram бота...")
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
-    # Передаем FB API ключи и ID в bot_data, чтобы они были доступны для send_daily_auto_report
     application.bot_data['admin_chat_id'] = ADMIN_TELEGRAM_ID
     application.bot_data['fb_access_token'] = FB_ACCESS_TOKEN
     application.bot_data['fb_app_id'] = FB_APP_ID
     application.bot_data['fb_app_secret'] = FB_APP_SECRET
     application.bot_data['ad_account_id'] = AD_ACCOUNT_ID
 
-    # НОВОЕ: Используем job_queue для безопасного запуска планировщика
     application.job_queue.run_once(start_scheduler_safely, 0) 
 
-    # Регистрируем обработчики для команд, текстовых сообщений и инлайн-кнопок
     application.add_handler(CommandHandler('start', start))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    application.add_handler(CallbackQueryHandler(button_callback)) # <-- ВОТ ОН, CallbackQueryHandler
-
+    application.add_handler(CallbackQueryHandler(button_callback))
+    
     print("Бот успешно запущен и ожидает событий...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+
+
+
+
+
+    # --- НАЧАЛО РАЗДЕЛА: НОВЫЙ ФУНКЦИОНАЛ (ЧАСТЬ 2) ---
+# Все новые функции, связанные с будущими "фишками", будут добавляться здесь.
+# Существующие функции (например, start, handle_message, button_callback)
+# будут лишь минимально модифицироваться для вызова этих новых функций.
+# --- КОНЕЦ РАЗДЕЛА: НОВЫЙ ФУНКЦИОНАЛ (ЧАСТЬ 2) ---
+
+# Здесь будут новые функции
