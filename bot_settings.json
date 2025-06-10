@@ -1,4 +1,15 @@
 {
     "auto_reports_enabled": true,
-    "report_time": "09:00"
+    "report_time": "09:00",
+    "notifications_enabled": true,
+    "cost_per_conversation_threshold": 1.5,
+    "last_cost_per_conversation_alert": null,
+    "login_code": "0105",
+    "authorized_users": [
+        5625120142,
+        7784744775
+    ],
+    "daily_orders": {
+        "2025-06-10": 1
+    }
 }
